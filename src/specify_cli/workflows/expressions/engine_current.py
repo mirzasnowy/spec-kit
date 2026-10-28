@@ -159,12 +159,51 @@ _COMPARISON_OPERATORS = ("!=", "==", ">=", "<=", ">", "<", " not in ", " in ")
 _leaf_sink: ContextVar[list[str] | None] = ContextVar("_leaf_sink", default=None)
 
 
+def _find_first_comparison(expr: str) -> tuple[int, str] | None:
+    """Earliest top-level comparison operator in ``expr``, or None.
+
+    Ties at one position prefer the longest operator, so ``>=`` wins over
+    ``>`` and `` not in `` wins over `` in `` -- the same precedence the old
+    first-match loop got from the order of ``_COMPARISON_OPERATORS``.
+    """
+    best: tuple[int, str] | None = None
+    for op in _COMPARISON_OPERATORS:
+        idx = _find_top_level(expr, op)
+        if idx == -1:
+            continue
+        if best is None or idx < best[0] or (idx == best[0] and len(op) > len(best[1])):
+            best = (idx, op)
+    return best
+
+
+def _apply_comparison(left: Any, op: str, right: Any) -> bool:
+    """One pairwise comparison, using the evaluator's existing semantics."""
+    if op == "==":
+        return left == right
+    if op == "!=":
+        return left != right
+    if op == ">":
+        return _safe_compare(left, right, ">")
+    if op == "<":
+        return _safe_compare(left, right, "<")
+    if op == ">=":
+        return _safe_compare(left, right, ">=")
+    if op == "<=":
+        return _safe_compare(left, right, "<=")
+    if op == " in ":
+        return _safe_membership(left, right, negate=False)
+    if op == " not in ":
+        return _safe_membership(left, right, negate=True)
+    raise ValueError(f"unknown comparison operator: {op!r}")
+
+
 def _evaluate_simple_expression(expr: str, namespace: dict[str, Any]) -> Any:
     """Evaluate a simple expression against the namespace.
 
     Supports:
     - Dot-path access: ``steps.specify.output.file``
     - Comparisons: ``==``, ``!=``, ``>``, ``<``, ``>=``, ``<=``
+    - Chained comparisons: ``a < b < c`` means ``(a < b) and (b < c)``
     - Boolean operators: ``and``, ``or``, ``not``
     - ``in``, ``not in``
     - Pipe filters: ``| default('...')``, ``| join(', ')``, ``| contains('...')``, ``| from_json``, ``| map('...')``, ``| split(',')``, ``| upper``, ``| lower``, ``| length``, ``| to_json``
@@ -282,30 +321,36 @@ def _evaluate_simple_expression(expr: str, namespace: dict[str, Any]) -> Any:
         inner = _evaluate_simple_expression(expr[4:].strip(), namespace)
         return not bool(inner)
 
-    # Comparison operators (order matters — check multi-char ops first). Split at
-    # the first top-level occurrence so an operator inside a quoted operand is
-    # ignored.
-    for op in _COMPARISON_OPERATORS:
-        op_idx = _find_top_level(expr, op)
-        if op_idx != -1:
-            left = _evaluate_simple_expression(expr[:op_idx].strip(), namespace)
-            right = _evaluate_simple_expression(expr[op_idx + len(op):].strip(), namespace)
-            if op == "==":
-                return left == right
-            if op == "!=":
-                return left != right
-            if op == ">":
-                return _safe_compare(left, right, ">")
-            if op == "<":
-                return _safe_compare(left, right, "<")
-            if op == ">=":
-                return _safe_compare(left, right, ">=")
-            if op == "<=":
-                return _safe_compare(left, right, "<=")
-            if op == " in ":
-                return _safe_membership(left, right, negate=False)
-            if op == " not in ":
-                return _safe_membership(left, right, negate=True)
+    # Comparison operators. Split at top-level occurrences so an operator inside
+    # a quoted operand is ignored. More than one top-level comparison operator
+    # makes this a CHAINED comparison, evaluated Python-style: ``a < b < c``
+    # means ``(a < b) and (b < c)``, with each middle operand evaluated once.
+    # Previously the split stopped at the first operator and evaluated the whole
+    # remainder as the right operand, so ``0 <= n <= 10`` read as
+    # ``0 <= (n <= 10)`` and silently took the wrong branch.
+    first = _find_first_comparison(expr)
+    if first is not None:
+        op_idx, op = first
+        operands = [expr[:op_idx].strip()]
+        operators = [op]
+        rest = expr[op_idx + len(op) :].strip()
+        while True:
+            nxt = _find_first_comparison(rest)
+            if nxt is None:
+                operands.append(rest)
+                break
+            n_idx, n_op = nxt
+            operands.append(rest[:n_idx].strip())
+            operators.append(n_op)
+            rest = rest[n_idx + len(n_op) :].strip()
+        # Every operand is evaluated, even after a False pair: validation
+        # probes (see the `or`/`and` handling above) must visit operands that
+        # runtime could skip, and operands here are side-effect-free.
+        values = [_evaluate_simple_expression(o, namespace) for o in operands]
+        return all(
+            _apply_comparison(left, op, right)
+            for left, op, right in zip(values, operators, values[1:])
+        )
 
     # Numeric literal
     try:

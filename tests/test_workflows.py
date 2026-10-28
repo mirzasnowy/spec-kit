@@ -1541,6 +1541,30 @@ class TestExpressions:
         assert evaluate_expression("{{ inputs.n >= 'abc' }}", ctx) is False
         assert evaluate_expression("{{ inputs.n <= 'abc' }}", ctx) is False
 
+    def test_chained_comparisons(self):
+        """``a < b < c`` means ``(a < b) and (b < c)``, Python-style.
+
+        The comparison split used to stop at the first operator and evaluate
+        the whole remainder as the right operand, so ``0 <= n <= 10`` read as
+        ``0 <= (n <= 10)`` -- a number against a boolean -- and an ``if``
+        step could silently take the wrong branch (n=50 ran the `inside`
+        branch). A chain with mixed operators pairs each operand with its
+        own operator, and every pair must hold.
+        """
+        from specify_cli.workflows.expressions import evaluate_condition
+        from specify_cli.workflows.base import StepContext
+
+        ctx = StepContext(inputs={"n": 5})
+        assert evaluate_condition("{{ 1 < inputs.n < 10 }}", ctx) is True
+        assert evaluate_condition("{{ 0 <= inputs.n <= 10 }}", ctx) is True
+        assert evaluate_condition("{{ 10 > inputs.n > 1 }}", ctx) is True
+        assert evaluate_condition("{{ 1 < inputs.n == 5 }}", ctx) is True
+        ctx = StepContext(inputs={"n": 50})
+        assert evaluate_condition("{{ 1 < inputs.n < 10 }}", ctx) is False
+        assert evaluate_condition("{{ 0 <= inputs.n <= 10 }}", ctx) is False
+        assert evaluate_condition("{{ 10 > inputs.n > 1 }}", ctx) is False
+        assert evaluate_condition("{{ 1 < inputs.n == 5 }}", ctx) is False
+
     def test_boolean_literals_are_case_insensitive(self):
         """``{{ True }}``/``{{ TRUE }}`` resolve as booleans, as the ``.lower()``
         branch intends; only lowercase was pinned before."""
